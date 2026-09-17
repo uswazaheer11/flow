@@ -79,6 +79,10 @@ VIDEO_POST_GENERATION_WAIT = 20
 
 VIDEO_UPLOAD_WAIT = 5
 
+VIDEO_MINIMUM_WAIT = 180
+
+VIDEO_RESULT_EXTRA_TIMEOUT = 420
+
 
 # ============================================================
 # LOG
@@ -3436,6 +3440,70 @@ def wait_animate_generation(page):
 
         break
 
+    # --------------------------------------------------------
+    # MANDATORY 3-MINUTE WAIT
+    #
+    # Even if Flow finishes before 180 seconds,
+    # we MUST wait until 180 seconds have passed
+    # from the moment video generation started.
+    # --------------------------------------------------------
+
+    elapsed = int(
+        time.time() -
+        start_time
+    )
+
+    remaining = (
+        VIDEO_MINIMUM_WAIT -
+        elapsed
+    )
+
+    if remaining > 0:
+
+        log(
+            f"[ANIMATE] Generation signal finished "
+            f"after {elapsed}s."
+        )
+
+        log(
+            f"[ANIMATE] MANDATORY minimum wait: "
+            f"{remaining}s remaining."
+        )
+
+        while remaining > 0:
+
+            sleep_for = min(
+                5,
+                remaining
+            )
+
+            time.sleep(
+                sleep_for
+            )
+
+            elapsed = int(
+                time.time() -
+                start_time
+            )
+
+            remaining = (
+                VIDEO_MINIMUM_WAIT -
+                elapsed
+            )
+
+            log(
+                f"[ANIMATE] Mandatory wait progress: "
+                f"{elapsed}/{VIDEO_MINIMUM_WAIT}s"
+            )
+
+    log(
+        "[ANIMATE] Mandatory 3-minute wait completed."
+    )
+
+    # --------------------------------------------------------
+    # Additional Flow result settling time
+    # --------------------------------------------------------
+
     log(
         f"[ANIMATE] Waiting additional "
         f"{VIDEO_POST_GENERATION_WAIT}s "
@@ -3446,10 +3514,14 @@ def wait_animate_generation(page):
         VIDEO_POST_GENERATION_WAIT
     )
 
-
 def get_video_elements_for_animate(page):
 
     found = []
+
+    # --------------------------------------------------------
+    # FIRST:
+    # Try normal <video> elements.
+    # --------------------------------------------------------
 
     videos = page.locator(
         "video"
@@ -3497,10 +3569,176 @@ def get_video_elements_for_animate(page):
                 "poster": poster,
                 "width": box["width"],
                 "height": box["height"],
+                "video_editor_button": False,
             })
 
         except Exception:
             pass
+
+    if found:
+        return found
+
+    # --------------------------------------------------------
+    # SECOND:
+    # Flow may expose the generated video as:
+    #
+    # aria="Open video in editor"
+    #
+    # This is what your actual Flow UI showed.
+    # --------------------------------------------------------
+
+    try:
+
+        buttons = page.locator(
+            'button[aria-label*="Open video in editor" i]'
+        )
+
+        for i in range(
+            buttons.count()
+        ):
+
+            try:
+
+                button = buttons.nth(i)
+
+                if not button.is_visible():
+                    continue
+
+                button_box = (
+                    button.bounding_box()
+                )
+
+                if not button_box:
+                    continue
+
+                # ------------------------------------------------
+                # Walk up through parent containers.
+                #
+                # We do NOT want the small button itself.
+                # We want the actual video tile around it so
+                # right-click opens Flow's media menu.
+                # ------------------------------------------------
+
+                best_box = None
+                best_locator = button
+
+                parent = button
+
+                for level in range(7):
+
+                    try:
+
+                        parent = parent.locator(
+                            "xpath=.."
+                        )
+
+                        if not parent.is_visible():
+                            continue
+
+                        parent_box = (
+                            parent.bounding_box()
+                        )
+
+                        if not parent_box:
+                            continue
+
+                        width = (
+                            parent_box["width"]
+                        )
+
+                        height = (
+                            parent_box["height"]
+                        )
+
+                        # ----------------------------------------
+                        # Typical Flow media tile is much larger
+                        # than the Open-in-editor button.
+                        # ----------------------------------------
+
+                        if (
+                            width >= 250
+                            and
+                            height >= 150
+                            and
+                            width <= 1200
+                            and
+                            height <= 900
+                        ):
+
+                            if best_box is None:
+
+                                best_box = (
+                                    parent_box
+                                )
+
+                                best_locator = (
+                                    parent
+                                )
+
+                            else:
+
+                                old_area = (
+                                    best_box["width"] *
+                                    best_box["height"]
+                                )
+
+                                new_area = (
+                                    width *
+                                    height
+                                )
+
+                                # Prefer the larger media
+                                # container, but not the page.
+                                if new_area > old_area:
+
+                                    best_box = (
+                                        parent_box
+                                    )
+
+                                    best_locator = (
+                                        parent
+                                    )
+
+                    except Exception:
+                        continue
+
+                if best_box is None:
+
+                    best_box = (
+                        button_box
+                    )
+
+                log(
+                    "[OK] Flow video editor tile detected."
+                )
+
+                log(
+                    f"    Button box: "
+                    f"{button_box}"
+                )
+
+                log(
+                    f"    Video tile box: "
+                    f"{best_box}"
+                )
+
+                found.append({
+                    "locator": best_locator,
+                    "button": button,
+                    "index": i,
+                    "box": best_box,
+                    "src": None,
+                    "poster": None,
+                    "width": best_box["width"],
+                    "height": best_box["height"],
+                    "video_editor_button": True,
+                })
+
+            except Exception:
+                pass
+
+    except Exception:
+        pass
 
     return found
 
@@ -3513,10 +3751,16 @@ def wait_for_animate_video(page):
 
     deadline = (
         time.time() +
-        VIDEO_UI_TIMEOUT
+        VIDEO_RESULT_EXTRA_TIMEOUT
     )
 
+    last_report = -1
+
     while time.time() < deadline:
+
+        # --------------------------------------------------------
+        # Direct <video> OR Flow video-editor tile
+        # --------------------------------------------------------
 
         videos = (
             get_video_elements_for_animate(
@@ -3527,9 +3771,36 @@ def wait_for_animate_video(page):
         if videos:
 
             log(
-                f"[OK] Generated video elements: "
+                f"[OK] Generated video result detected: "
                 f"{len(videos)}"
             )
+
+            for i, video in enumerate(
+                videos,
+                start=1
+            ):
+
+                box = video.get(
+                    "box"
+                )
+
+                log(
+                    f"[VIDEO {i}] "
+                    f"x={round(box['x'])} "
+                    f"y={round(box['y'])} "
+                    f"w={round(box['width'])} "
+                    f"h={round(box['height'])}"
+                )
+
+                if video.get(
+                    "video_editor_button",
+                    False
+                ):
+
+                    log(
+                        "[VIDEO] Detected through "
+                        "'Open video in editor' tile."
+                    )
 
             print_videos(
                 videos
@@ -3537,8 +3808,37 @@ def wait_for_animate_video(page):
 
             return videos
 
+        elapsed = int(
+            (
+                VIDEO_RESULT_EXTRA_TIMEOUT
+                -
+                max(
+                    0,
+                    deadline - time.time()
+                )
+            )
+        )
+
+        ten_second_block = (
+            elapsed // 10
+        )
+
+        if (
+            ten_second_block !=
+            last_report
+        ):
+
+            last_report = (
+                ten_second_block
+            )
+
+            log(
+                f"[WAIT] Waiting for Flow video tile... "
+                f"{elapsed}s"
+            )
+
         time.sleep(
-            1
+            5
         )
 
     # --------------------------------------------------------
@@ -3556,7 +3856,7 @@ def wait_for_animate_video(page):
     )
 
     log(
-        "[ANIMATE] Direct <video> element "
+        "[ANIMATE] Generated video tile "
         "was not detected."
     )
 
@@ -3594,7 +3894,7 @@ def wait_for_animate_video(page):
         )
 
         log(
-            f"[ANIMATE] Page text saved:"
+            "[ANIMATE] Page text saved:"
         )
 
         log(
@@ -3606,15 +3906,21 @@ def wait_for_animate_video(page):
 
     raise RuntimeError(
         "Animate generation completed, "
-        "but generated video element was not detected."
+        "but generated video tile was not detected."
     )
 
 
-def find_animate_video_download_item(page):
+def find_animate_video_quality_option(page):
 
     menuitems = page.get_by_role(
         "menuitem"
     )
+
+    visible_items = []
+
+    # --------------------------------------------------------
+    # Collect all visible menu items
+    # --------------------------------------------------------
 
     for i in range(
         menuitems.count()
@@ -3631,20 +3937,120 @@ def find_animate_video_download_item(page):
                 item.inner_text().split()
             )
 
-            if (
-                text.lower() == "download"
-                or
-                text.lower().endswith(
-                    " download"
-                )
-            ):
+            lower = text.lower()
 
-                return item
+            if lower == "download":
+                continue
+
+            visible_items.append(
+                (
+                    item,
+                    text,
+                    lower
+                )
+            )
 
         except Exception:
             pass
 
+    # --------------------------------------------------------
+    # Debug all visible quality options
+    # --------------------------------------------------------
+
+    log(
+        "[ANIMATE DOWNLOAD] Visible video "
+        "quality menuitems:"
+    )
+
+    for item, text, lower in visible_items:
+
+        log(
+            f"    {text!r}"
+        )
+
+    # --------------------------------------------------------
+    # PRIORITY 1:
+    # Exact 720p + Original size in same menuitem
+    # --------------------------------------------------------
+
+    for item, text, lower in visible_items:
+
+        normalized = (
+            lower
+            .replace(" ", "")
+            .replace("\n", "")
+        )
+
+        if (
+            "720p" in normalized
+            and
+            "originalsize" in normalized
+        ):
+
+            log(
+                "[OK] Selected 720p Original size."
+            )
+
+            return item
+
+    # --------------------------------------------------------
+    # PRIORITY 2:
+    # Exact 720p menu item.
+    #
+    # In your Flow screenshot, 720p and Original size
+    # are displayed as separate text lines inside the option.
+    # --------------------------------------------------------
+
+    for item, text, lower in visible_items:
+
+        normalized = (
+            lower
+            .replace(" ", "")
+            .replace("\n", "")
+        )
+
+        if normalized == "720p":
+
+            log(
+                "[OK] Selected exact 720p option."
+            )
+
+            return item
+
+    # --------------------------------------------------------
+    # PRIORITY 3:
+    # Any menuitem containing 720p.
+    # --------------------------------------------------------
+
+    for item, text, lower in visible_items:
+
+        if "720p" in lower:
+
+            log(
+                f"[OK] Selected 720p option: "
+                f"{text!r}"
+            )
+
+            return item
+
+    # --------------------------------------------------------
+    # No 720p found.
+    #
+    # IMPORTANT:
+    # Do NOT silently select 1080p / 4K.
+    # --------------------------------------------------------
+
+    log(
+        "[ANIMATE DOWNLOAD] 720p option NOT FOUND."
+    )
+
+    log(
+        "[ANIMATE DOWNLOAD] Refusing to "
+        "fallback to 1080p or 4K."
+    )
+
     return None
+
 
 
 def find_animate_video_quality_option(page):
